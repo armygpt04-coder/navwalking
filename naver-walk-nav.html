@@ -106,6 +106,7 @@
       <input class="search-input" id="endInput" type="text" placeholder="목적지 입력">
     </div>
     <button class="btn-go" id="goBtn" onclick="startNavigation()">🚶 경로 탐색</button>
+    <button class="btn-go" id="bleBtn" onclick="connectBLE()">📶 BLE 연결</button>
   </div>
 </div>
 
@@ -184,6 +185,14 @@ let navigationSteps = [];
 let currentStepIndex = 0;
 let destinationLabel = '';
 let routeSummaryData = null;
+let bleDevice = null;
+let bleServer = null;
+let bleCharacteristic = null;
+let lastBleCommand = '';
+let bleReady = false;
+
+const BLE_SERVICE_UUID = '12345678-1234-1234-1234-1234567890ab';
+const BLE_CHARACTERISTIC_UUID = 'abcdefab-1234-1234-1234-abcdefabcdef';
 let isRerouting = false;
 let routeFullPath = [];       // 전체 경로 좌표 배열 저장
 let passedPolyline = null;    // 지나온 경로 (흐릿하게)
@@ -202,7 +211,81 @@ const GUIDE_TYPE = {
   17: { icon: '🏁', label: '도착' },
   18: { icon: '↑',  label: '직진' },
 };
+function updateBLEButtonUI() {
+  const btn = document.getElementById('bleBtn');
+  if (!btn) return;
 
+  if (bleReady) {
+    btn.textContent = '✅ BLE 연결됨';
+    btn.style.opacity = '1';
+  } else {
+    btn.textContent = '📶 BLE 연결';
+    btn.style.opacity = '1';
+  }
+}
+
+async function connectBLE() {
+  if (!navigator.bluetooth) {
+    alert('이 브라우저는 Web Bluetooth를 지원하지 않습니다.\n안드로이드 Chrome에서 실행하세요.');
+    return;
+  }
+
+  try {
+    bleDevice = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [BLE_SERVICE_UUID] }],
+      optionalServices: [BLE_SERVICE_UUID]
+    });
+
+    bleDevice.addEventListener('gattserverdisconnected', function() {
+      bleReady = false;
+      bleServer = null;
+      bleCharacteristic = null;
+      updateBLEButtonUI();
+      console.log('BLE 연결 해제');
+    });
+
+    bleServer = await bleDevice.gatt.connect();
+    const service = await bleServer.getPrimaryService(BLE_SERVICE_UUID);
+    bleCharacteristic = await service.getCharacteristic(BLE_CHARACTERISTIC_UUID);
+
+    bleReady = true;
+    updateBLEButtonUI();
+    alert('ESP32 BLE 연결 완료');
+  } catch (err) {
+    console.error('BLE 연결 실패:', err);
+    bleReady = false;
+    bleServer = null;
+    bleCharacteristic = null;
+    updateBLEButtonUI();
+    alert('BLE 연결 실패: ' + err.message);
+  }
+}
+
+async function sendBLE(message) {
+  if (!bleReady || !bleCharacteristic || !message) return;
+
+  if (lastBleCommand === message) return;
+
+  try {
+    const data = new TextEncoder().encode(message);
+    await bleCharacteristic.writeValue(data);
+    lastBleCommand = message;
+    console.log('BLE sent:', message);
+  } catch (err) {
+    console.error('BLE 전송 실패:', err);
+  }
+}
+
+function getBleCommandFromStep(step, remainDistance) {
+  if (!step) return 'STRAIGHT';
+
+  if (step.type === 17 || remainDistance <= 8) return 'ARRIVE';
+  if (step.type === 7 || step.type === 6 || step.type === 8) return 'LEFT';
+  if (step.type === 3 || step.type === 2 || step.type === 4) return 'RIGHT';
+  if (step.type === 5) return 'UTURN';
+
+  return 'STRAIGHT';
+}
 // ── 지도 초기화 (네이버 지도 SDK 콜백) ───────────────
 function initMap() {
   document.getElementById('mapLoading').style.display = 'none';
@@ -212,6 +295,7 @@ function initMap() {
   });
   bindFollowEvents();
   bindStartInputEvents();
+  updateBLEButtonUI();
   startLiveTracking();
 }
 
@@ -298,14 +382,18 @@ function updateNavIndicator(step, remainDistance) {
     nextIn.textContent = '경로 안내';
     nextStreet.textContent = destinationLabel ? destinationLabel + ' 방향' : '목적지 방향';
     if (routeSummaryData) etaTime.innerHTML = routeSummaryData.timeMin + '<small style="font-size:13px">분</small>';
+    sendBLE('STRAIGHT');
     return;
   }
+
   nextTurnIcon.textContent = step.icon || '🚶';
   nextIn.textContent = remainDistance <= 10 ? '지금' : Math.round(remainDistance) + 'm 후';
   nextStreet.textContent = step.instruction;
   if (routeSummaryData) etaTime.innerHTML = routeSummaryData.timeMin + '<small style="font-size:13px">분</small>';
-}
 
+  const bleCommand = getBleCommandFromStep(step, remainDistance);
+  sendBLE(bleCommand);
+}
 // ── GPS 위치 기반 내비 진행 ───────────────────────────
 function updateNavigationByLocation(lat, lng) {
   if (!navigationSteps.length) return;
@@ -321,6 +409,7 @@ function updateNavigationByLocation(lat, lng) {
     document.getElementById('nextTurnIcon').textContent = '🏁';
     document.getElementById('nextIn').textContent = '도착';
     document.getElementById('nextStreet').textContent = '목적지에 거의 도착했습니다';
+    sendBLE('ARRIVE');
   }
 }
 
