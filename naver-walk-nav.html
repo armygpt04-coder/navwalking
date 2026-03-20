@@ -236,6 +236,40 @@ function updateBLEButtonUI() {
     btn.style.opacity = '1';
   }
 }
+async function connectBLE() {
+  if (!navigator.bluetooth) {
+    alert('이 브라우저는 Web Bluetooth를 지원하지 않습니다.\n안드로이드 Chrome에서 실행하세요.');
+    return;
+  }
+
+  try {
+    if (!bleDevice) {
+      bleDevice = await navigator.bluetooth.requestDevice({
+        filters: [{ services: [BLE_SERVICE_UUID] }],
+        optionalServices: [BLE_SERVICE_UUID]
+      });
+
+      bleDevice.addEventListener('gattserverdisconnected', onBleDisconnected);
+    }
+
+    await setupBleConnection();
+
+    bleReady = true;
+    bleReconnectAttempts = 0;
+    updateBLEButtonUI();
+    alert('ESP32 BLE 연결 완료');
+
+    await syncCurrentStateToDevice();
+  } catch (err) {
+    console.error('BLE 연결 실패:', err);
+    bleReady = false;
+    bleServer = null;
+    bleCharacteristic = null;
+    bleNotifyCharacteristic = null;
+    updateBLEButtonUI();
+    alert('BLE 연결 실패: ' + err.message);
+  }
+}
 
 async function setupBleConnection() {
   bleServer = await bleDevice.gatt.connect();
