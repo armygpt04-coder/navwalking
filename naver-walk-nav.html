@@ -173,6 +173,7 @@
 <script src="https://oapi.map.naver.com/openapi/v3/maps.js?ncpKeyId=6cm1gapanx&submodules=geocoder,geometry&callback=initMap"></script>
 
 <script>
+// ── 전역 변수 ─────────────────────────────────────────
 let map, startMarker, endMarker, routePolyline, currentSteps = [];
 let myMarker = null;
 let myAccuracyCircle = null;
@@ -186,11 +187,10 @@ let destinationLabel = '';
 let routeSummaryData = null;
 let bleDevice = null;
 let bleServer = null;
-let bleCharacteristic = null;
-let bleNotifyCharacteristic = null;
+let bleCharacteristic = null;        // write characteristic
+let bleNotifyCharacteristic = null;  // notify characteristic
 let lastBleCommand = '';
 let bleReady = false;
-let bleIntervalTimer = null;
 
 const BLE_SERVICE_UUID = '12345678-1234-1234-1234-1234567890ab';
 const BLE_CHARACTERISTIC_UUID = 'abcdefab-1234-1234-1234-abcdefabcdef';
@@ -207,9 +207,9 @@ const BLE_MAX_RECONNECT_ATTEMPTS = 5;
 
 let lastAnnouncedStepIndex = -1;
 let isRerouting = false;
-let routeFullPath = [];
-let passedPolyline = null;
-let closestPathIndex = 0;
+let routeFullPath = [];       // 전체 경로 좌표 배열 저장
+let passedPolyline = null;    // 지나온 경로 (흐릿하게)
+let closestPathIndex = 0;     // 현재 경로상 가장 가까운 포인트 인덱스
 
 const GUIDE_TYPE = {
   1:  { icon: '↑',  label: '직진' },
@@ -224,7 +224,6 @@ const GUIDE_TYPE = {
   17: { icon: '🏁', label: '도착' },
   18: { icon: '↑',  label: '직진' },
 };
-
 function updateBLEButtonUI() {
   const btn = document.getElementById('bleBtn');
   if (!btn) return;
@@ -237,7 +236,6 @@ function updateBLEButtonUI() {
     btn.style.opacity = '1';
   }
 }
-
 async function connectBLE() {
   if (!navigator.bluetooth) {
     alert('이 브라우저는 Web Bluetooth를 지원하지 않습니다.\n안드로이드 Chrome에서 실행하세요.');
@@ -262,7 +260,6 @@ async function connectBLE() {
     alert('ESP32 BLE 연결 완료');
 
     await syncCurrentStateToDevice();
-    startBleLoop();
   } catch (err) {
     console.error('BLE 연결 실패:', err);
     bleReady = false;
@@ -327,7 +324,6 @@ async function tryReconnectBLE() {
       console.log('BLE 자동 재연결 성공');
 
       await syncCurrentStateToDevice();
-      startBleLoop();
     } catch (err) {
       console.warn('BLE 재연결 실패:', err.message);
       bleReconnectTimer = setTimeout(async function() {
@@ -361,6 +357,10 @@ function handleBleNotification(event) {
 
 async function sendBLE(message) {
   if (!bleReady || !bleCharacteristic || !message) return false;
+
+  if (lastBleCommand === message && blePendingAck === null) {
+    return true;
+  }
 
   for (let attempt = 1; attempt <= BLE_MAX_RETRIES; attempt++) {
     try {
@@ -425,7 +425,6 @@ function getBleCommandFromStep(step, remainDistance) {
 
   return 'STRAIGHT';
 }
-
 async function syncCurrentStateToDevice() {
   if (!bleReady) return;
 
@@ -443,38 +442,7 @@ async function syncCurrentStateToDevice() {
   const cmd = getBleCommandFromStep(step, 0);
   await sendBLE(cmd);
 }
-
-function stopBleLoop() {
-  if (bleIntervalTimer) {
-    clearInterval(bleIntervalTimer);
-    bleIntervalTimer = null;
-  }
-}
-
-function startBleLoop() {
-  stopBleLoop();
-
-  bleIntervalTimer = setInterval(function() {
-    if (!bleReady) return;
-    if (!currentLatLng) return;
-    if (!navigationSteps.length) return;
-
-    const step = navigationSteps[currentStepIndex];
-    if (!step) return;
-
-    const remainDistance = getDistanceMeters(
-      currentLatLng.lat(),
-      currentLatLng.lng(),
-      step.lat,
-      step.lng
-    );
-
-    const cmd = getBleCommandFromStep(step, remainDistance);
-    console.log('2초 주기 BLE 전송:', cmd);
-    sendBLE(cmd);
-  }, 2000);
-}
-
+// ── 지도 초기화 (네이버 지도 SDK 콜백) ───────────────
 function initMap() {
   document.getElementById('mapLoading').style.display = 'none';
   map = new naver.maps.Map('naverMap', {
@@ -487,6 +455,7 @@ function initMap() {
   startLiveTracking();
 }
 
+// ── 출발지 입력 이벤트 ───────────────────────────────
 function bindStartInputEvents() {
   const startInput = document.getElementById('startInput');
   if (!startInput) return;
@@ -497,6 +466,7 @@ function bindStartInputEvents() {
   });
 }
 
+// ── 현재 위치를 출발지로 설정 ─────────────────────────
 function setCurrentLocationAsStart(lat, lng) {
   const startInput = document.getElementById('startInput');
   if (!startInput) return;
@@ -506,6 +476,7 @@ function setCurrentLocationAsStart(lat, lng) {
   startInput.dataset.lng = String(lng);
 }
 
+// ── 두 좌표 간 거리 계산 (미터) ──────────────────────
 function getDistanceMeters(lat1, lng1, lat2, lng2) {
   const R = 6371000;
   const toRad = function(deg) { return deg * Math.PI / 180; };
@@ -516,13 +487,13 @@ function getDistanceMeters(lat1, lng1, lat2, lng2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
 }
 
+// ── 내비게이션 스텝 구성 ──────────────────────────────
 function buildNavigationSteps(path, guides) {
   if (!Array.isArray(path) || !Array.isArray(guides)) {
     navigationSteps = [];
     currentStepIndex = 0;
     lastAnnouncedStepIndex = -1;
     lastBleCommand = '';
-    stopBleLoop();
     return;
   }
   navigationSteps = guides
@@ -543,16 +514,16 @@ function buildNavigationSteps(path, guides) {
       };
     });
   currentStepIndex = 0;
-  lastAnnouncedStepIndex = -1;
-  lastBleCommand = '';
 }
 
+// ── 현재 턴 하이라이트 ────────────────────────────────
 function updateActiveTurnItem(index) {
   const items = document.querySelectorAll('.turn-item');
   items.forEach(function(item, i) { item.classList.toggle('active-turn', i === index); });
   if (items[index]) items[index].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
 }
 
+// ── 하단 내비 인디케이터 업데이트 ────────────────────
 function updateNavIndicator(step, remainDistance) {
   const navIndicator = document.getElementById('navIndicator');
   const walkingBadge = document.getElementById('walkingBadge');
@@ -576,8 +547,10 @@ function updateNavIndicator(step, remainDistance) {
   nextIn.textContent = remainDistance <= 10 ? '지금' : Math.round(remainDistance) + 'm 후';
   nextStreet.textContent = step.instruction;
   if (routeSummaryData) etaTime.innerHTML = routeSummaryData.timeMin + '<small style="font-size:13px">분</small>';
-}
 
+  const bleCommand = getBleCommandFromStep(step, remainDistance);
+}
+// ── GPS 위치 기반 내비 진행 ───────────────────────────
 function updateNavigationByLocation(lat, lng) {
   if (!navigationSteps.length) return;
 
@@ -613,12 +586,14 @@ function updateNavigationByLocation(lat, lng) {
   }
 }
 
+// ── 경로 진행 추적 (지나온 경로 제거) ────────────────
 function updateRouteProgress(lat, lng) {
   if (!routeFullPath.length) return;
 
+  // 현재 위치에서 가장 가까운 경로 포인트 찾기 (closestPathIndex 이후만 탐색)
   let minDist = Infinity;
   let minIdx = closestPathIndex;
-  const searchEnd = Math.min(closestPathIndex + 50, routeFullPath.length);
+  const searchEnd = Math.min(closestPathIndex + 50, routeFullPath.length); // 앞으로 50포인트만 탐색
   for (let i = closestPathIndex; i < searchEnd; i++) {
     const pt = routeFullPath[i];
     const d = getDistanceMeters(lat, lng, pt.lat(), pt.lng());
@@ -626,11 +601,13 @@ function updateRouteProgress(lat, lng) {
   }
   closestPathIndex = minIdx;
 
+  // 남은 경로 업데이트 (현재 위치 포인트부터)
   const remainingPath = routeFullPath.slice(closestPathIndex);
   if (routePolyline) {
     routePolyline.setPath(remainingPath);
   }
 
+  // 지나온 경로 업데이트 (흐릿한 선)
   const passedPath = routeFullPath.slice(0, closestPathIndex + 1);
   if (passedPolyline) {
     passedPolyline.setPath(passedPath);
@@ -645,6 +622,7 @@ function updateRouteProgress(lat, lng) {
   }
 }
 
+// ── 경로까지 최소 거리 계산 ───────────────────────────
 function getMinDistanceToRoute(lat, lng) {
   if (!routePolyline) return Infinity;
   const path = routePolyline.getPath();
@@ -657,6 +635,7 @@ function getMinDistanceToRoute(lat, lng) {
   return minDist;
 }
 
+// ── 경로 이탈 감지 및 재탐색 ─────────────────────────
 async function checkRouteDeviation(lat, lng) {
   if (!navigationSteps.length || isRerouting) return;
   const distToRoute = getMinDistanceToRoute(lat, lng);
@@ -690,11 +669,6 @@ async function checkRouteDeviation(lat, lng) {
       endMarker = makeMarker(endData.latlng, '#ff5252', '🏁 ' + endAddr);
       buildTurnList(route.guide || []);
       buildNavigationSteps(route.path || [], route.guide || []);
-
-      if (currentLatLng && navigationSteps.length) {
-        updateNavigationByLocation(currentLatLng.lat(), currentLatLng.lng());
-      }
-      startBleLoop();
     } catch (e) {
       document.getElementById('turnList').innerHTML = '<div class="error-box">⚠️ 재탐색 실패: ' + e.message + '</div>';
     } finally {
@@ -703,6 +677,7 @@ async function checkRouteDeviation(lat, lng) {
   }
 }
 
+// ── 지도 드래그/줌 시 follow 모드 해제 ───────────────
 function bindFollowEvents() {
   naver.maps.Event.addListener(map, 'dragstart', function() {
     if (!isProgrammaticMove) { followMode = false; updateFollowButtonUI(); }
@@ -712,6 +687,7 @@ function bindFollowEvents() {
   });
 }
 
+// ── follow 버튼 UI 업데이트 ───────────────────────────
 function updateFollowButtonUI() {
   const btn = document.querySelector('.locate-btn');
   if (!btn) return;
@@ -719,6 +695,7 @@ function updateFollowButtonUI() {
   btn.style.transform = followMode ? 'scale(1.05)' : 'scale(1)';
 }
 
+// ── 지도를 내 위치로 이동 ─────────────────────────────
 function moveMapToMyLocation(latlng, zoom) {
   if (!map || !latlng) return;
   zoom = zoom || 17;
@@ -728,6 +705,7 @@ function moveMapToMyLocation(latlng, zoom) {
   setTimeout(function() { isProgrammaticMove = false; }, 300);
 }
 
+// ── 내 위치 버튼 클릭 ─────────────────────────────────
 function locateMe() {
   followMode = true;
   updateFollowButtonUI();
@@ -750,6 +728,7 @@ function locateMe() {
   );
 }
 
+// ── 주소 → 좌표 (Promise) ────────────────────────────
 function geocode(address) {
   return new Promise(function(resolve, reject) {
     naver.maps.Service.geocode({ query: address }, function(status, res) {
@@ -767,6 +746,7 @@ function geocode(address) {
   });
 }
 
+// ── 마커 생성 ─────────────────────────────────────────
 function makeMarker(pos, color, label) {
   return new naver.maps.Marker({
     map: map,
@@ -778,6 +758,7 @@ function makeMarker(pos, color, label) {
   });
 }
 
+// ── 내 위치 마커 업데이트 ─────────────────────────────
 function updateMyLocationMarker(lat, lng, accuracy) {
   accuracy = accuracy || 0;
   const latlng = new naver.maps.LatLng(lat, lng);
@@ -804,6 +785,7 @@ function updateMyLocationMarker(lat, lng, accuracy) {
   }
 }
 
+// ── 위치를 서버로 전송 ────────────────────────────────
 async function sendLocationToServer(lat, lng, accuracy) {
   try {
     await fetch('/api/location', {
@@ -816,6 +798,7 @@ async function sendLocationToServer(lat, lng, accuracy) {
   }
 }
 
+// ── 실시간 위치 추적 시작 ─────────────────────────────
 function startLiveTracking() {
   if (!navigator.geolocation) { console.error('이 브라우저는 위치 추적을 지원하지 않습니다.'); return; }
   if (watchId !== null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
@@ -838,6 +821,7 @@ function startLiveTracking() {
   );
 }
 
+// ── 경로 탐색 ─────────────────────────────────────────
 async function startNavigation() {
   if (!map) { alert('지도가 아직 로딩 중입니다.'); return; }
 
@@ -896,7 +880,7 @@ async function startNavigation() {
     document.getElementById('statCalorie').textContent = cal;
 
     const pathCoords = route.path.map(function(p) { return new naver.maps.LatLng(p[1], p[0]); });
-    routeFullPath = pathCoords;
+    routeFullPath = pathCoords;  // 전체 경로 저장
     routePolyline = new naver.maps.Polyline({ map: map, path: pathCoords, strokeColor: '#58a6ff', strokeOpacity: 0.9, strokeWeight: 5 });
 
     startMarker = makeMarker(startData.latlng, '#58a6ff', '🚶 내 위치');
@@ -923,7 +907,6 @@ async function startNavigation() {
     startInput.value = '내 위치';
     startInput.dataset.useCurrentLocation = 'true';
 
-    startBleLoop();
   } catch (e) {
     document.getElementById('turnList').innerHTML = '<div class="error-box">⚠️ ' + (e.message || e) + '<br><br>서버가 실행 중인지 확인하고,<br>API 키가 올바른지 확인해주세요.</div>';
     console.error(e);
@@ -933,6 +916,7 @@ async function startNavigation() {
   }
 }
 
+// ── 턴바이턴 목록 렌더 ────────────────────────────────
 function buildTurnList(guides) {
   const list = document.getElementById('turnList');
   list.innerHTML = '';
@@ -966,6 +950,7 @@ function buildTurnList(guides) {
   });
 }
 
+// ── 장소 검색 ─────────────────────────────────────────
 let searchTimer;
 function searchPlaces(q) {
   clearTimeout(searchTimer);
@@ -998,6 +983,7 @@ function searchPlaces(q) {
   }, 400);
 }
 
+// ── 탭 전환 ───────────────────────────────────────────
 function switchTab(name, el) {
   document.querySelectorAll('.tab').forEach(function(t) { t.classList.remove('active'); });
   document.querySelectorAll('.tab-content').forEach(function(t) { t.classList.remove('active'); });
