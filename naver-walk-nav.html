@@ -187,12 +187,25 @@ let destinationLabel = '';
 let routeSummaryData = null;
 let bleDevice = null;
 let bleServer = null;
-let bleCharacteristic = null;
+let bleCharacteristic = null;        // write characteristic
+let bleNotifyCharacteristic = null;  // notify characteristic
 let lastBleCommand = '';
 let bleReady = false;
 
 const BLE_SERVICE_UUID = '12345678-1234-1234-1234-1234567890ab';
 const BLE_CHARACTERISTIC_UUID = 'abcdefab-1234-1234-1234-abcdefabcdef';
+const BLE_NOTIFY_UUID = 'fedcfedc-1234-1234-1234-fedcfedcfedc';
+
+let bleMsgSeq = 0;
+let blePendingAck = null;
+let bleAckResolver = null;
+let bleReconnectTimer = null;
+let bleReconnectAttempts = 0;
+const BLE_ACK_TIMEOUT = 1500;
+const BLE_MAX_RETRIES = 3;
+const BLE_MAX_RECONNECT_ATTEMPTS = 5;
+
+let lastAnnouncedStepIndex = -1;
 let isRerouting = false;
 let routeFullPath = [];       // 전체 경로 좌표 배열 저장
 let passedPolyline = null;    // 지나온 경로 (흐릿하게)
@@ -224,56 +237,148 @@ function updateBLEButtonUI() {
   }
 }
 
-async function connectBLE() {
-  if (!navigator.bluetooth) {
-    alert('이 브라우저는 Web Bluetooth를 지원하지 않습니다.\n안드로이드 Chrome에서 실행하세요.');
-    return;
-  }
+async function setupBleConnection() {
+  bleServer = await bleDevice.gatt.connect();
 
+  const service = await bleServer.getPrimaryService(BLE_SERVICE_UUID);
+
+  bleCharacteristic = await service.getCharacteristic(BLE_CHARACTERISTIC_UUID);
+  bleNotifyCharacteristic = await service.getCharacteristic(BLE_NOTIFY_UUID);
+
+  await bleNotifyCharacteristic.startNotifications();
+  bleNotifyCharacteristic.removeEventListener('characteristicvaluechanged', handleBleNotification);
+  bleNotifyCharacteristic.addEventListener('characteristicvaluechanged', handleBleNotification);
+
+  bleReady = true;
+  updateBLEButtonUI();
+}
+
+function onBleDisconnected() {
+  bleReady = false;
+  bleServer = null;
+  bleCharacteristic = null;
+  bleNotifyCharacteristic = null;
+  updateBLEButtonUI();
+  console.log('BLE 연결 해제');
+
+  tryReconnectBLE();
+}
+
+async function tryReconnectBLE() {
+  if (!bleDevice) return;
+  if (bleReconnectTimer) return;
+
+  const attemptReconnect = async function() {
+    if (bleReady) {
+      bleReconnectTimer = null;
+      return;
+    }
+
+    if (bleReconnectAttempts >= BLE_MAX_RECONNECT_ATTEMPTS) {
+      console.warn('BLE 자동 재연결 실패');
+      bleReconnectTimer = null;
+      return;
+    }
+
+    bleReconnectAttempts++;
+
+    try {
+      console.log('BLE 재연결 시도:', bleReconnectAttempts);
+      await setupBleConnection();
+      bleReconnectAttempts = 0;
+      bleReconnectTimer = null;
+      console.log('BLE 자동 재연결 성공');
+
+      await syncCurrentStateToDevice();
+    } catch (err) {
+      console.warn('BLE 재연결 실패:', err.message);
+      bleReconnectTimer = setTimeout(async function() {
+        bleReconnectTimer = null;
+        await attemptReconnect();
+      }, 2000);
+    }
+  };
+
+  bleReconnectTimer = setTimeout(async function() {
+    bleReconnectTimer = null;
+    await attemptReconnect();
+  }, 2000);
+}
+
+function handleBleNotification(event) {
   try {
-    bleDevice = await navigator.bluetooth.requestDevice({
-      filters: [{ services: [BLE_SERVICE_UUID] }],
-      optionalServices: [BLE_SERVICE_UUID]
-    });
+    const raw = new TextDecoder().decode(event.target.value);
+    const msg = JSON.parse(raw);
 
-    bleDevice.addEventListener('gattserverdisconnected', function() {
-      bleReady = false;
-      bleServer = null;
-      bleCharacteristic = null;
-      updateBLEButtonUI();
-      console.log('BLE 연결 해제');
-    });
-
-    bleServer = await bleDevice.gatt.connect();
-    const service = await bleServer.getPrimaryService(BLE_SERVICE_UUID);
-    bleCharacteristic = await service.getCharacteristic(BLE_CHARACTERISTIC_UUID);
-
-    bleReady = true;
-    updateBLEButtonUI();
-    alert('ESP32 BLE 연결 완료');
+    if (bleAckResolver && msg.ack === bleAckResolver.id) {
+      const resolve = bleAckResolver.resolve;
+      blePendingAck = null;
+      bleAckResolver = null;
+      resolve(true);
+    }
   } catch (err) {
-    console.error('BLE 연결 실패:', err);
-    bleReady = false;
-    bleServer = null;
-    bleCharacteristic = null;
-    updateBLEButtonUI();
-    alert('BLE 연결 실패: ' + err.message);
+    console.error('BLE notify parse 실패:', err);
   }
 }
 
 async function sendBLE(message) {
-  if (!bleReady || !bleCharacteristic || !message) return;
+  if (!bleReady || !bleCharacteristic || !message) return false;
 
-  if (lastBleCommand === message) return;
-
-  try {
-    const data = new TextEncoder().encode(message);
-    await bleCharacteristic.writeValue(data);
-    lastBleCommand = message;
-    console.log('BLE sent:', message);
-  } catch (err) {
-    console.error('BLE 전송 실패:', err);
+  if (lastBleCommand === message && blePendingAck === null) {
+    return true;
   }
+
+  for (let attempt = 1; attempt <= BLE_MAX_RETRIES; attempt++) {
+    try {
+      await writeBleWithAck(message);
+      lastBleCommand = message;
+      console.log('BLE sent:', message, 'attempt:', attempt);
+      return true;
+    } catch (err) {
+      console.warn('BLE 전송 재시도:', attempt, err.message);
+      await wait(250);
+    }
+  }
+
+  console.error('BLE 전송 실패:', message);
+  return false;
+}
+
+async function writeBleWithAck(message) {
+  const payload = {
+    id: ++bleMsgSeq,
+    cmd: message,
+    ts: Date.now()
+  };
+
+  const data = new TextEncoder().encode(JSON.stringify(payload));
+
+  const ackPromise = new Promise((resolve, reject) => {
+    blePendingAck = payload.id;
+
+    bleAckResolver = {
+      id: payload.id,
+      resolve: resolve,
+      reject: reject
+    };
+
+    setTimeout(function() {
+      if (blePendingAck === payload.id) {
+        blePendingAck = null;
+        bleAckResolver = null;
+        reject(new Error('ACK timeout'));
+      }
+    }, BLE_ACK_TIMEOUT);
+  });
+
+  await bleCharacteristic.writeValue(data);
+  return ackPromise;
+}
+
+function wait(ms) {
+  return new Promise(function(resolve) {
+    setTimeout(resolve, ms);
+  });
 }
 
 function getBleCommandFromStep(step, remainDistance) {
@@ -285,6 +390,23 @@ function getBleCommandFromStep(step, remainDistance) {
   if (step.type === 5) return 'UTURN';
 
   return 'STRAIGHT';
+}
+async function syncCurrentStateToDevice() {
+  if (!bleReady) return;
+
+  if (!navigationSteps.length) {
+    await sendBLE('STRAIGHT');
+    return;
+  }
+
+  const step = navigationSteps[currentStepIndex];
+  if (!step) {
+    await sendBLE('STRAIGHT');
+    return;
+  }
+
+  const cmd = getBleCommandFromStep(step, 0);
+  await sendBLE(cmd);
 }
 // ── 지도 초기화 (네이버 지도 SDK 콜백) ───────────────
 function initMap() {
@@ -336,6 +458,8 @@ function buildNavigationSteps(path, guides) {
   if (!Array.isArray(path) || !Array.isArray(guides)) {
     navigationSteps = [];
     currentStepIndex = 0;
+    lastAnnouncedStepIndex = -1;
+    lastBleCommand = '';
     return;
   }
   navigationSteps = guides
@@ -382,7 +506,6 @@ function updateNavIndicator(step, remainDistance) {
     nextIn.textContent = '경로 안내';
     nextStreet.textContent = destinationLabel ? destinationLabel + ' 방향' : '목적지 방향';
     if (routeSummaryData) etaTime.innerHTML = routeSummaryData.timeMin + '<small style="font-size:13px">분</small>';
-    sendBLE('STRAIGHT');
     return;
   }
 
@@ -392,24 +515,40 @@ function updateNavIndicator(step, remainDistance) {
   if (routeSummaryData) etaTime.innerHTML = routeSummaryData.timeMin + '<small style="font-size:13px">분</small>';
 
   const bleCommand = getBleCommandFromStep(step, remainDistance);
-  sendBLE(bleCommand);
 }
 // ── GPS 위치 기반 내비 진행 ───────────────────────────
 function updateNavigationByLocation(lat, lng) {
   if (!navigationSteps.length) return;
+
   const currentStep = navigationSteps[currentStepIndex];
   if (!currentStep) return;
+
   const distToCurrent = getDistanceMeters(lat, lng, currentStep.lat, currentStep.lng);
-  if (distToCurrent < 25 && currentStepIndex < navigationSteps.length - 1) currentStepIndex++;
+
+  if (distToCurrent < 25 && currentStepIndex < navigationSteps.length - 1) {
+    currentStepIndex++;
+  }
+
   const step = navigationSteps[currentStepIndex];
   const remainDistance = getDistanceMeters(lat, lng, step.lat, step.lng);
+
   updateActiveTurnItem(currentStepIndex);
   updateNavIndicator(step, remainDistance);
+
+  if (lastAnnouncedStepIndex !== currentStepIndex) {
+    const bleCommand = getBleCommandFromStep(step, remainDistance);
+    sendBLE(bleCommand);
+    lastAnnouncedStepIndex = currentStepIndex;
+  }
+
   if (currentStepIndex === navigationSteps.length - 1 && remainDistance < 25) {
     document.getElementById('nextTurnIcon').textContent = '🏁';
     document.getElementById('nextIn').textContent = '도착';
     document.getElementById('nextStreet').textContent = '목적지에 거의 도착했습니다';
-    sendBLE('ARRIVE');
+
+    if (lastBleCommand !== 'ARRIVE') {
+      sendBLE('ARRIVE');
+    }
   }
 }
 
@@ -466,7 +605,7 @@ function getMinDistanceToRoute(lat, lng) {
 async function checkRouteDeviation(lat, lng) {
   if (!navigationSteps.length || isRerouting) return;
   const distToRoute = getMinDistanceToRoute(lat, lng);
-  if (distToRoute > 40) {
+  if (distToRoute > 25) {
     isRerouting = true;
     const endAddr = document.getElementById('endInput').value.trim();
     if (!endAddr) { isRerouting = false; return; }
